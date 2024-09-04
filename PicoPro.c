@@ -2,6 +2,7 @@
  * The MIT License (MIT)
  *
  * Copyright (c) 2019 Ha Thach (tinyusb.org)
+ *                    sekigon-gonnoc
  * Copyright (c) 2024 Nato Logic
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -24,89 +25,115 @@
  *
  */
 
+// This example runs both host and device concurrently. The USB host receive
+// reports from HID device and print it out over USB Device CDC interface.
+// For TinyUSB roothub port0 is native usb controller, roothub port1 is
+// pico-pio-usb.
+
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 
-#include "bsp/board_api.h"
+#include "hardware/clocks.h"
+#include "pico/stdlib.h"
+#include "pico/multicore.h"
+#include "pico/bootrom.h"
+
+#include "pio_usb.h"
 #include "tusb.h"
+#include "pico/time.h"
 
 
-#include <stdint.h>
-#include <unistd.h>
+typedef struct {
+  char key;
+  int byte;
+  int shift;
+} switchButtonMaps;
+
+typedef struct {
+  int byte;
+  int shift;
+} buttonLocation;
+
+buttonLocation findSwitchMap(switchButtonMaps buttonMap[], int size, char key) {
+  buttonLocation loc = { -1, -1 };
+  for (int i=0; i < size; i++) {
+    if (buttonMap[i].key == key) {
+      loc.byte = buttonMap[i].byte;
+      loc.shift = buttonMap[i].shift;
+      break;
+    }
+  }
+  return loc;
+}
+
+// IN ORDER:
+// mapped character, byte of button input report (starting from 0, which is byte 3 in the final report), bitshift count 
+switchButtonMaps buttonMap[] = { \
+  {'y', 0, 0}, /* Y button         */ \
+  {'x', 0, 1}, /* X button         */ \
+  {'b', 0, 2}, /* B button         */ \
+  {'a', 0, 3}, /* A button         */ \
+  {'r', 0, 6}, /* R button         */ \
+  {'z', 0, 7} /* ZR button        */ \
+};
 
 
 //--------------------------------------------------------------------+
 // MACRO CONSTANT TYPEDEF PROTYPES
 //--------------------------------------------------------------------+
 
-/* Blink pattern
- * - 250 ms  : device not mounted
- * - 1000 ms : device mounted
- * - 2500 ms : device is suspended
- */
-enum  {
-  BLINK_NOT_MOUNTED = 250,
-  BLINK_MOUNTED = 1000,
-  BLINK_SUSPENDED = 2500,
-};
 
-static uint32_t blink_interval_ms = BLINK_NOT_MOUNTED;
-
-void led_blinking_task(void);
 void counter_task(void);
 void button_task(void);
 
-/*------------- MAIN -------------*/
-int main(void)
-{
-  board_init();
+static uint8_t const keycode2ascii[128][2] =  { HID_KEYCODE_TO_ASCII };
+uint32_t button_pressed = 0;
 
-  // init device stack on configured roothub port
+/*------------- MAIN -------------*/
+
+// core1: handle host events
+void core1_main() {
+  sleep_ms(10);
+
+  stdio_uart_init ();
+  // Use tuh_configure() to pass pio configuration to the host stack
+  // Note: tuh_configure() must be called before
+  pio_usb_configuration_t pio_cfg = PIO_USB_DEFAULT_CONFIG;
+  tuh_configure(1, TUH_CFGID_RPI_PIO_USB_CONFIGURATION, &pio_cfg);
+
+  // To run USB SOF interrupt in core1, init host stack for pio_usb (roothub
+  // port1) on core1
+  tuh_init(1);
+
+  while (true) {
+    tuh_task(); // tinyusb host task
+  }
+}
+
+// core0: handle device events
+int main(void) {
+  stdio_init_all();
+  // default 125MHz is not appropreate. Sysclock should be multiple of 12MHz.
+  set_sys_clock_khz(120000, true);
+
+  sleep_ms(10);
+
+  multicore_reset_core1();
+  // all USB task run in core1
+  multicore_launch_core1(core1_main);
+
+  // init device stack on native usb (roothub port0)
   tud_init(BOARD_TUD_RHPORT);
 
-  if (board_init_after_tusb) {
-    board_init_after_tusb();
-  }
-
-  while (1)
-  {
+  while (true) {
     tud_task(); // tinyusb device task
-    led_blinking_task();
     counter_task();
     button_task();
+    fflush(stdout);
   }
-}
 
-//--------------------------------------------------------------------+
-// Device callbacks
-//--------------------------------------------------------------------+
-
-// Invoked when device is mounted
-void tud_mount_cb(void)
-{
-  blink_interval_ms = BLINK_MOUNTED;
-}
-
-// Invoked when device is unmounted
-void tud_umount_cb(void)
-{
-  blink_interval_ms = BLINK_NOT_MOUNTED;
-}
-
-// Invoked when usb bus is suspended
-// remote_wakeup_en : if host allow us  to perform remote wakeup
-// Within 7ms, device must draw an average of current less than 2.5 mA from bus
-void tud_suspend_cb(bool remote_wakeup_en)
-{
-  (void) remote_wakeup_en;
-  blink_interval_ms = BLINK_SUSPENDED;
-}
-
-// Invoked when usb bus is resumed
-void tud_resume_cb(void)
-{
-  blink_interval_ms = tud_mounted() ? BLINK_MOUNTED : BLINK_NOT_MOUNTED;
+  return 0;
 }
 
 //--------------------------------------------------------------------+
@@ -114,6 +141,8 @@ void tud_resume_cb(void)
 //--------------------------------------------------------------------+
 
 
+
+uint8_t final_thirdbyte = 0x00;
 
 // Thanks to MIZUNO Yuki for these https://www.mzyy94.com/blog/2020/03/20/nintendo-switch-pro-controller-usb-gadget/
 uint8_t extended_mac_addr[] = { 0x00, 0x03, 0x00, 0x00, 0x5e, 0x00, 0x53, 0x5e };
@@ -207,19 +236,16 @@ void tud_hid_set_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t rep
   printf("\n");
   if (buffer[0] == 0x80) {
       if (buffer[1] == 0x01) {
-          printf("mac address\n");
           response(0x81, 0x01, (uint8_t *)extended_mac_addr, sizeof(extended_mac_addr));
       } 
       else if (buffer[1] == 0x02) {
-          printf("handshake\n");
           response(0x81, 0x02, (uint8_t *)0x00, 1);
       }
-      // else if (buffer[1] == 0x03) {
-      //     printf("baud update\n");
-      //     response(0x81, 0x03, (uint8_t *)0x00, 1);
-      // }
+      else if (buffer[1] == 0x03) {
+          printf("baud update\n");
+          response(0x81, 0x03, (uint8_t *)0x00, 1);
+      }
       else if (buffer[1] == 0x04) {
-          printf("start usb\n");
           ok_to_send_presses = true;
       }  
   }
@@ -264,20 +290,135 @@ void tud_hid_set_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t rep
 }
 
 //--------------------------------------------------------------------+
-// BLINKING TASK
+// Host HID
 //--------------------------------------------------------------------+
-void led_blinking_task(void)
+
+// Invoked when device with hid interface is mounted
+// Report descriptor is also available for use. tuh_hid_parse_report_descriptor()
+// can be used to parse common/simple enough descriptor.
+// Note: if report descriptor length > CFG_TUH_ENUMERATION_BUFSIZE, it will be skipped
+// therefore report_desc = NULL, desc_len = 0
+void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, uint8_t const* desc_report, uint16_t desc_len)
 {
-  static uint32_t start_ms = 0;
-  static bool led_state = false;
+  (void)desc_report;
+  (void)desc_len;
 
-  // Blink every interval ms
-  if ( board_millis() - start_ms < blink_interval_ms) return; // not enough time
-  start_ms += blink_interval_ms;
+  // Interface protocol (hid_interface_protocol_enum_t)
+  const char* protocol_str[] = { "None", "Keyboard", "Mouse" };
+  uint8_t const itf_protocol = tuh_hid_interface_protocol(dev_addr, instance);
 
-  board_led_write(led_state);
-  led_state = 1 - led_state; // toggle
+  uint16_t vid, pid;
+  tuh_vid_pid_get(dev_addr, &vid, &pid);
+
+  char tempbuf[256];
+  int count = sprintf(tempbuf, "[%04x:%04x][%u] HID Interface%u, Protocol = %s\r\n", vid, pid, dev_addr, instance, protocol_str[itf_protocol]);
+  printf(tempbuf);
+  fflush(stdout);
+
+  // Receive report from boot keyboard & mouse only
+  // tuh_hid_report_received_cb() will be invoked when report is available
+  if (itf_protocol == HID_ITF_PROTOCOL_KEYBOARD || itf_protocol == HID_ITF_PROTOCOL_MOUSE)
+  {
+    if ( !tuh_hid_receive_report(dev_addr, instance) )
+    {
+      printf("Error: cannot request report\r\n");
+    }
+  }
 }
+
+// Invoked when device with hid interface is un-mounted
+void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance)
+{
+  char tempbuf[256];
+  int count = sprintf(tempbuf, "[%u] HID Interface%u is unmounted\r\n", dev_addr, instance);
+  printf(tempbuf);
+  fflush(stdout);
+}
+
+// look up new key in previous keys
+static inline bool find_key_in_report(hid_keyboard_report_t const *report, uint8_t keycode)
+{
+  for(uint8_t i=0; i<6; i++)
+  {
+    if (report->keycode[i] == keycode)  return true;
+  }
+
+  return false;
+}
+
+
+// convert hid keycode to ascii
+static void process_kbd_report(uint8_t dev_addr, hid_keyboard_report_t const *report)
+{
+  (void) dev_addr;
+  // start by assuming the byte is all zeros (all released)
+  uint8_t thirdbyte = 0x00;
+  // check all 6 elements of the report to see if any of the corresponding keys are pressed
+  for(uint8_t i=0; i<6; i++)
+  {
+    uint8_t keycode = report->keycode[i];
+    if ( keycode ) {
+      bool const is_shift = report->modifier & (KEYBOARD_MODIFIER_LEFTSHIFT | KEYBOARD_MODIFIER_RIGHTSHIFT);
+      char ch = is_shift ? keycode2ascii[keycode][1] : keycode2ascii[keycode][0];
+      //printf("%c: ",ch);
+      buttonLocation loc = findSwitchMap(buttonMap, sizeof(buttonMap) / sizeof(buttonMap[0]), ch);
+      if (loc.byte != -1 && loc.shift != -1) {
+        //printf("%d\r\n",loc.shift);
+        thirdbyte = thirdbyte | 1 << loc.shift;
+      }
+      else {
+        //printf("not in mapping\r\n");
+      }
+      //fflush(stdout);
+    }
+  }
+  printf("0x%02hhx\r\n", thirdbyte);
+  fflush(stdout);
+  final_thirdbyte = thirdbyte;
+}
+
+// send mouse report 
+static void process_mouse_report(uint8_t dev_addr, hid_mouse_report_t const * report)
+{
+  //------------- button state  -------------//
+  //uint8_t button_changed_mask = report->buttons ^ prev_report.buttons;
+  char l = report->buttons & MOUSE_BUTTON_LEFT   ? 'L' : '-';
+  char m = report->buttons & MOUSE_BUTTON_MIDDLE ? 'M' : '-';
+  char r = report->buttons & MOUSE_BUTTON_RIGHT  ? 'R' : '-';
+
+  char tempbuf[32];
+  int count = sprintf(tempbuf, "[%u] %c%c%c %d %d %d\r\n", dev_addr, l, m, r, report->x, report->y, report->wheel);
+  printf(tempbuf);
+  fflush(stdout);
+}
+
+// Invoked when received report from device via interrupt endpoint
+void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance, uint8_t const* report, uint16_t len)
+{
+  (void) len;
+  uint8_t const itf_protocol = tuh_hid_interface_protocol(dev_addr, instance);
+
+  switch(itf_protocol)
+  {
+    case HID_ITF_PROTOCOL_KEYBOARD:
+      process_kbd_report(dev_addr, (hid_keyboard_report_t const*) report );
+    break;
+
+    case HID_ITF_PROTOCOL_MOUSE:
+      process_mouse_report(dev_addr, (hid_mouse_report_t const*) report );
+    break;
+
+    default: break;
+  }
+
+  // continue to request to receive report
+  if ( !tuh_hid_receive_report(dev_addr, instance) )
+  {
+    printf("Error: cannot request report\r\n");
+  }
+}
+
+
 
 //--------------------------------------------------------------------+
 // COUNTER AND BUTTON TASKS
@@ -286,22 +427,17 @@ void counter_task(void)
 {
   static uint32_t start_ms = 0;
   // Blink every interval ms
-  if ( board_millis() - start_ms < 30) return; // not enough time
+  if ( to_ms_since_boot(get_absolute_time()) - start_ms < 30) return; // not enough time
   start_ms += 30;
   counter = (counter + 3) % 256;
 }
 
 void button_task(void)
 {
-  uint32_t const button_pressed = board_button_read();
   static uint32_t start_ms = 0;
   // Blink every interval ms
-  if (( board_millis() - start_ms < 30) || mutex_held == true || ok_to_send_presses == false) return; // not enough time
+  if (( to_ms_since_boot(get_absolute_time()) - start_ms < 30) || mutex_held == true || ok_to_send_presses == false) return; // not enough time
   start_ms += 30;
-  if (button_pressed) {
-    response(0x30, counter, (uint8_t *)a_button_press_response, sizeof(a_button_press_response));
-  }
-  else {
-    response(0x30, counter, (uint8_t *)a_button_release_response, sizeof(a_button_release_response));
-  }
+  uint8_t test_button_response[] = { 0x81, final_thirdbyte, 0x80, 0x00, 0xf8, 0xd7, 0x7a, 0x22, 0xc8, 0x7b, 0x0c };
+  response(0x30, counter, (uint8_t *)test_button_response, sizeof(test_button_response));
 }
