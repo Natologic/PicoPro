@@ -73,9 +73,13 @@ switchButtonMaps buttonMap[] = { \
   {'y', 0, 0}, /* Y button         */ \
   {'x', 0, 1}, /* X button         */ \
   {'b', 0, 2}, /* B button         */ \
-  {'a', 0, 3}, /* A button         */ \
+  {'e', 0, 3}, /* A button         */ \
   {'r', 0, 6}, /* R button         */ \
-  {'z', 0, 7} /* ZR button        */ \
+  {'z', 0, 7}, /* ZR button        */ \
+  {'w', 3, 0}, /* Left stick up    */ \
+  {'s', 3, 1}, /* Left stick down  */ \
+  {'a', 3, 2}, /* Left stick left  */ \
+  {'d', 3, 3}, /* Left stick up    */ \
 };
 
 
@@ -89,6 +93,8 @@ void button_task(void);
 
 static uint8_t const keycode2ascii[128][2] =  { HID_KEYCODE_TO_ASCII };
 uint32_t button_pressed = 0;
+bool rotate = false;
+
 
 /*------------- MAIN -------------*/
 
@@ -102,6 +108,8 @@ void core1_main() {
   pio_usb_configuration_t pio_cfg = PIO_USB_DEFAULT_CONFIG;
   tuh_configure(1, TUH_CFGID_RPI_PIO_USB_CONFIGURATION, &pio_cfg);
 
+  // Set default protocol to enable additional buttons on mouse
+  tuh_hid_set_default_protocol(HID_PROTOCOL_REPORT);
   // To run USB SOF interrupt in core1, init host stack for pio_usb (roothub
   // port1) on core1
   tuh_init(1);
@@ -143,6 +151,22 @@ int main(void) {
 
 
 uint8_t final_thirdbyte = 0x00;
+uint8_t imudata1a = 0x00;
+uint8_t imudata1b = 0x00;
+uint8_t imudata2a = 0x00;
+uint8_t imudata2b = 0x00;
+uint8_t imudata3a = 0x00;
+uint8_t imudata3b = 0x00;
+
+
+
+// neutral location for joystick?
+uint8_t joystick_neutral[] = {0xFF, 0xF7, 0x7F};
+uint8_t left_joystick[] = {0x00, 0x00, 0x00};
+
+uint8_t imu_data1[] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+uint8_t imu_data2[] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+uint8_t imu_data3[] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
 
 // Thanks to MIZUNO Yuki for these https://www.mzyy94.com/blog/2020/03/20/nintendo-switch-pro-controller-usb-gadget/
 uint8_t extended_mac_addr[] = { 0x00, 0x03, 0x00, 0x00, 0x5e, 0x00, 0x53, 0x5e };
@@ -155,8 +179,6 @@ uint8_t user_stick[] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0
 uint8_t user_motion[] = { 0xBE, 0xFF, 0x3E, 0x00, 0xF0, 0x01, 0x00, 0x40, 0x00, 0x40, 0x00, 0x40, 0xFE, 0xFF, 0xFE, 0xFF, 0x08, 0x00, 0xE7, 0x3B, 0xE7, 0x3B, 0xE7, 0x3B };
 uint8_t nfc_ir[] = { 0x01, 0x00, 0xFF, 0x00, 0x03, 0x00, 0x05, 0x01 };
 uint8_t initial_input[] = { 0x81, 0x00, 0x80, 0x00, 0xf8, 0xd7, 0x7a, 0x22, 0xc8, 0x7b, 0x0c };
-uint8_t a_button_press_response[] = { 0x81, 0x08, 0x80, 0x00, 0xf8, 0xd7, 0x7a, 0x22, 0xc8, 0x7b, 0x0c };
-uint8_t a_button_release_response[] =  { 0x81, 0x00, 0x80, 0x00, 0xf8, 0xd7, 0x7a, 0x22, 0xc8, 0x7b, 0x0c };
 uint8_t info_from_device[] = {0x03,0x48,0x03,0x02,0xe5,0x35,0x00,0xe5,0x00,0x00,0x03,0x01 };
 
 bool ok_to_send_presses = false;
@@ -346,6 +368,17 @@ static inline bool find_key_in_report(hid_keyboard_report_t const *report, uint8
   return false;
 }
 
+// Convert joystick values ranging from 0 to 2047 (neutral) to 4095 (max, higher numbers will overflow)
+void to_joystick(int horiz, int vert, uint8_t *data) {
+    uint8_t byte0 = horiz & 0x00FF; // mask out high byte to get low byte
+    uint8_t byte1nibblelow = (horiz >> 8) & 0x000F; // bitshift high byte to low byte and mask out all but lowest nibble
+    uint8_t byte1nibblehigh = (vert & 0x000F) << 4; // mask out all but lowest nibble and bitshift it to high nibble
+    uint8_t byte1 = byte1nibblelow | byte1nibblehigh; // bitwise or together middle nibbles
+    uint8_t byte2 = (vert >> 4) & 0x00FF; // bitshift all bytes by one nibble and mask out high byte to get low byte
+    data[0] = byte0;
+    data[1] = byte1;
+    data[2] = byte2;
+}
 
 // convert hid keycode to ascii
 static void process_kbd_report(uint8_t dev_addr, hid_keyboard_report_t const *report)
@@ -353,6 +386,10 @@ static void process_kbd_report(uint8_t dev_addr, hid_keyboard_report_t const *re
   (void) dev_addr;
   // start by assuming the byte is all zeros (all released)
   uint8_t thirdbyte = 0x00;
+  // neutral location for joystick?
+  memcpy(left_joystick, joystick_neutral, sizeof(joystick_neutral));
+  int vert = 2047;
+  int horiz = 2047;
   // check all 6 elements of the report to see if any of the corresponding keys are pressed
   for(uint8_t i=0; i<6; i++)
   {
@@ -363,8 +400,24 @@ static void process_kbd_report(uint8_t dev_addr, hid_keyboard_report_t const *re
       //printf("%c: ",ch);
       buttonLocation loc = findSwitchMap(buttonMap, sizeof(buttonMap) / sizeof(buttonMap[0]), ch);
       if (loc.byte != -1 && loc.shift != -1) {
+        if (loc.byte == 3) {
+          if (loc.shift == 0) {
+            vert = 4095;
+          }
+          else if (loc.shift == 1) {
+            vert = 0;
+          }
+          else if (loc.shift == 2) {
+            horiz = 0;
+          }
+          else if (loc.shift == 3) {
+            horiz = 4095;
+          }
+        }
+        else {
+          thirdbyte = thirdbyte | 1 << loc.shift;
+        }
         //printf("%d\r\n",loc.shift);
-        thirdbyte = thirdbyte | 1 << loc.shift;
       }
       else {
         //printf("not in mapping\r\n");
@@ -375,8 +428,11 @@ static void process_kbd_report(uint8_t dev_addr, hid_keyboard_report_t const *re
   printf("0x%02hhx\r\n", thirdbyte);
   fflush(stdout);
   final_thirdbyte = thirdbyte;
+  to_joystick(horiz, vert, left_joystick);
 }
 
+int16_t x_current_hid = 0;
+int16_t y_current_hid = 0;
 // send mouse report 
 static void process_mouse_report(uint8_t dev_addr, hid_mouse_report_t const * report)
 {
@@ -385,11 +441,16 @@ static void process_mouse_report(uint8_t dev_addr, hid_mouse_report_t const * re
   char l = report->buttons & MOUSE_BUTTON_LEFT   ? 'L' : '-';
   char m = report->buttons & MOUSE_BUTTON_MIDDLE ? 'M' : '-';
   char r = report->buttons & MOUSE_BUTTON_RIGHT  ? 'R' : '-';
+  char b = report->buttons & MOUSE_BUTTON_BACKWARD  ? 'B' : '-';
+  char f = report->buttons & MOUSE_BUTTON_FORWARD ? 'F' : '-';
 
-  char tempbuf[32];
-  int count = sprintf(tempbuf, "[%u] %c%c%c %d %d %d\r\n", dev_addr, l, m, r, report->x, report->y, report->wheel);
-  printf(tempbuf);
-  fflush(stdout);
+  // char tempbuf[32];
+  // int count = sprintf(tempbuf, "[%u] %c%c%c%c%c %d %d %d\r\n", dev_addr, l, m, r, b, f, report->x, report->y, report->wheel);  
+  // printf(tempbuf);
+  // fflush(stdout);
+
+  x_current_hid += (report->x)*-1;
+  y_current_hid += (report->y)*1;
 }
 
 // Invoked when received report from device via interrupt endpoint
@@ -432,12 +493,45 @@ void counter_task(void)
   counter = (counter + 3) % 256;
 }
 
+int16_t x_delta = 0;
+int16_t x_last = 0;
+int16_t y_delta = 0;
+int16_t y_last = 0;
 void button_task(void)
 {
   static uint32_t start_ms = 0;
   // Blink every interval ms
   if (( to_ms_since_boot(get_absolute_time()) - start_ms < 30) || mutex_held == true || ok_to_send_presses == false) return; // not enough time
   start_ms += 30;
-  uint8_t test_button_response[] = { 0x81, final_thirdbyte, 0x80, 0x00, 0xf8, 0xd7, 0x7a, 0x22, 0xc8, 0x7b, 0x0c };
-  response(0x30, counter, (uint8_t *)test_button_response, sizeof(test_button_response));
+  x_delta = (x_current_hid - x_last)*1;
+  x_last = x_current_hid;
+  y_delta = (y_current_hid - y_last)*0.1;
+  y_last = y_current_hid;
+
+
+  // convert all the deltas to little endian
+  imu_data1[10] = (x_delta >> 8 & 0xFF);
+  imu_data1[11] = (x_delta & 0xFF);
+  imu_data2[10] = (x_delta >> 8 & 0xFF);
+  imu_data2[11] = (x_delta & 0xFF);
+  imu_data3[10] = (x_delta >> 8 & 0xFF);
+  imu_data3[11] = (x_delta & 0xFF);
+
+  // convert all the deltas to little endian
+  imu_data1[8] = (y_delta >> 8 & 0xFF);
+  imu_data1[9] = (y_delta & 0xFF);
+  imu_data2[8] = (y_delta >> 8 & 0xFF);
+  imu_data2[9] = (y_delta & 0xFF);
+  imu_data3[8] = (y_delta >> 8 & 0xFF);
+  imu_data3[9] = (y_delta & 0xFF);
+  
+  //uint8_t test_button_response[] = { 0x81, final_thirdbyte, 0x80, 0x00, 0xf8, 0xd7, 0x7a, 0x22, 0xc8, 0x7b, 0x0c };
+  uint8_t test_button_response[] = { 0x81, final_thirdbyte, 0x80, 0x00, left_joystick[0], left_joystick[1], left_joystick[2], 0x22, 0xc8, 0x7b, 0x0c };
+  uint8_t buttons_and_joysticks[] = { 0x81, final_thirdbyte, 0x80, 0x00, left_joystick[0], left_joystick[1], left_joystick[2], 0x22, 0xc8, 0x7b, 0x0c };
+  uint8_t final_response[sizeof(buttons_and_joysticks) + sizeof(imu_data1) + sizeof(imu_data2) + sizeof(imu_data3)];
+  memcpy(final_response,buttons_and_joysticks, sizeof(buttons_and_joysticks) * sizeof(uint8_t));
+  memcpy(final_response+sizeof(buttons_and_joysticks),imu_data1, sizeof(imu_data1) * sizeof(uint8_t));
+  memcpy(final_response+sizeof(buttons_and_joysticks)+sizeof(imu_data1),imu_data2, sizeof(imu_data2) * sizeof(uint8_t));
+  memcpy(final_response+sizeof(buttons_and_joysticks)+sizeof(imu_data1)+sizeof(imu_data2),imu_data3, sizeof(imu_data3) * sizeof(uint8_t));
+  response(0x30, counter, (uint8_t *)final_response, sizeof(final_response));
 }
