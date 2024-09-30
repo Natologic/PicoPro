@@ -68,14 +68,18 @@ buttonLocation findSwitchMap(switchButtonMaps buttonMap[], int size, char key) {
 }
 
 // IN ORDER:
-// mapped character, byte of button input report (starting from 0, which is byte 3 in the final report), bitshift count 
+// mapped character
+// byte of button input report (starting from 0, which is byte 3 in the final report). 3
+// bitshift count 
 switchButtonMaps buttonMap[] = { \
   {'y', 0, 0}, /* Y button         */ \
   {'x', 0, 1}, /* X button         */ \
-  {'b', 0, 2}, /* B button         */ \
+  {' ', 0, 2}, /* B button         */ \
   {'e', 0, 3}, /* A button         */ \
   {'r', 0, 6}, /* R button         */ \
   {'z', 0, 7}, /* ZR button        */ \
+  {'p', 1, 1}, /* Plus button      */ \
+  {'q', 2, 7}, /* ZL button        */ \
   {'w', 3, 0}, /* Left stick up    */ \
   {'s', 3, 1}, /* Left stick down  */ \
   {'a', 3, 2}, /* Left stick left  */ \
@@ -148,9 +152,8 @@ int main(void) {
 // USB HID
 //--------------------------------------------------------------------+
 
-
-
-uint8_t final_thirdbyte = 0x00;
+// 3-byte package that holds the standard button report
+uint8_t final_buttons[] = { 0x00, 0x00, 0x00 };
 uint8_t imudata1a = 0x00;
 uint8_t imudata1b = 0x00;
 uint8_t imudata2a = 0x00;
@@ -192,12 +195,12 @@ void response(uint8_t command, uint8_t response, uint8_t *buffer, size_t buffer_
     report[0] = command;
     report[1] = response;
     memcpy(report + 2, buffer, buffer_len);
-    printf("To Switch: ");
-    for (int i = 0; i < 64; i++)
-    {
-        printf("%02X", report[i]);
-    }
-    printf("\n");
+    // printf("To Switch: ");
+    // for (int i = 0; i < 64; i++)
+    // {
+    //     printf("%02X", report[i]);
+    // }
+    // printf("\n");
     tud_hid_report(0, report, 64);
     mutex_held = false;
 }
@@ -247,15 +250,14 @@ void tud_hid_set_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t rep
   (void) report_id;
   (void) report_type;
 
-  //tud_hid_report(0, buffer, bufsize);
-  printf("From Switch: ");
-  for (int i = 0; i < bufsize; i++)
-  {
-      printf("%02X", buffer[i]);
-  }
+  // printf("From Switch: ");
+  // for (int i = 0; i < bufsize; i++)
+  // {
+  //     printf("%02X", buffer[i]);
+  // }
+  // printf("\n");
 
   // Thanks to MIZUNO Yuki for this code https://www.mzyy94.com/blog/2020/03/20/nintendo-switch-pro-controller-usb-gadget/
-  printf("\n");
   if (buffer[0] == 0x80) {
       if (buffer[1] == 0x01) {
           response(0x81, 0x01, (uint8_t *)extended_mac_addr, sizeof(extended_mac_addr));
@@ -380,55 +382,115 @@ void to_joystick(int horiz, int vert, uint8_t *data) {
     data[2] = byte2;
 }
 
+int vert = 2047;
+int horiz = 2047;
+int offset = 2047;
+
 // convert hid keycode to ascii
 static void process_kbd_report(uint8_t dev_addr, hid_keyboard_report_t const *report)
 {
   (void) dev_addr;
-  // start by assuming the byte is all zeros (all released)
-  uint8_t thirdbyte = 0x00;
+  static hid_keyboard_report_t prev_report = { 0, 0, {0} }; // previous report to check key released
+  // start by assuming the bytes are all zeros (all released)
+  uint8_t buttons[] = { 0x00, 0x00, 0x00 };
+  // container for change mask, where bit will be set to 1 if it _changes_ (this could be from 1 to 0 or from 0 to 1)
+  uint8_t buttons_change_mask[] = { 0x00, 0x00, 0x00 };
   // neutral location for joystick?
   memcpy(left_joystick, joystick_neutral, sizeof(joystick_neutral));
-  int vert = 2047;
-  int horiz = 2047;
+
   // check all 6 elements of the report to see if any of the corresponding keys are pressed
   for(uint8_t i=0; i<6; i++)
   {
     uint8_t keycode = report->keycode[i];
-    if ( keycode ) {
-      bool const is_shift = report->modifier & (KEYBOARD_MODIFIER_LEFTSHIFT | KEYBOARD_MODIFIER_RIGHTSHIFT);
-      char ch = is_shift ? keycode2ascii[keycode][1] : keycode2ascii[keycode][0];
-      //printf("%c: ",ch);
-      buttonLocation loc = findSwitchMap(buttonMap, sizeof(buttonMap) / sizeof(buttonMap[0]), ch);
-      if (loc.byte != -1 && loc.shift != -1) {
-        if (loc.byte == 3) {
-          if (loc.shift == 0) {
-            vert = 4095;
-          }
-          else if (loc.shift == 1) {
-            vert = 0;
-          }
-          else if (loc.shift == 2) {
-            horiz = 0;
-          }
-          else if (loc.shift == 3) {
-            horiz = 4095;
-          }
-        }
-        else {
-          thirdbyte = thirdbyte | 1 << loc.shift;
-        }
-        //printf("%d\r\n",loc.shift);
+    if (keycode) {
+      if (find_key_in_report(&prev_report, keycode)) {
+        // exist in previous report means the current key is holding
       }
       else {
-        //printf("not in mapping\r\n");
+        //bool const is_shift = report->modifier & (KEYBOARD_MODIFIER_LEFTSHIFT | KEYBOARD_MODIFIER_RIGHTSHIFT);
+        //char ch = is_shift ? keycode2ascii[keycode][1] : keycode2ascii[keycode][0];
+        char ch = keycode2ascii[keycode][0];
+        //printf("%c: ",ch);
+        buttonLocation loc = findSwitchMap(buttonMap, sizeof(buttonMap) / sizeof(buttonMap[0]), ch);
+        if (loc.byte != -1 && loc.shift != -1) {
+          if (loc.byte == 3) {
+            if (loc.shift == 0) {
+              //vert = 4095;
+              vert+=offset;
+            }
+            else if (loc.shift == 1) {
+              //vert = 0;
+              vert-=offset;
+            }
+            else if (loc.shift == 2) {
+              //horiz = 0;
+              horiz-=offset;
+            }
+            else if (loc.shift == 3) {
+              //horiz = 4095;
+              horiz+=offset;
+            }
+          }
+          else {
+            buttons[loc.byte] = buttons[loc.byte] | 1 << loc.shift;
+            buttons_change_mask[loc.byte] = buttons_change_mask[loc.byte] | 1 << loc.shift;
+          }
+          //printf("%d\r\n",loc.shift);
+        }
+        else {
+          //printf("not in mapping\r\n");
+        }
+        //fflush(stdout);
       }
-      //fflush(stdout);
+    }
+    // Check for key released
+    uint8_t prev_keycode = prev_report.keycode[i];
+    if ( prev_keycode && !find_key_in_report(report, prev_keycode) )
+    {
+      // key existed in previous report but not in current report means the key is released
+      char ch = keycode2ascii[prev_keycode][0];
+      buttonLocation loc = findSwitchMap(buttonMap, sizeof(buttonMap) / sizeof(buttonMap[0]), ch);
+        if (loc.byte != -1 && loc.shift != -1) {
+          if (loc.byte == 3) {
+            if (loc.shift == 0) {
+              //vert = 2047;
+              vert-=offset;
+            }
+            else if (loc.shift == 1) {
+              //vert = 2047;
+              vert+=offset;
+            }
+            else if (loc.shift == 2) {
+              //horiz = 2047;
+              horiz+=offset;
+            }
+            else if (loc.shift == 3) {
+              //horiz = 2047;
+              horiz-=offset;
+            }
+          }
+          else {
+            buttons[loc.byte] = buttons[loc.byte] | 0 << loc.shift;
+            buttons_change_mask[loc.byte] = buttons_change_mask[loc.byte] | 1 << loc.shift;
+          }
+          //printf("%d\r\n",loc.shift);
+        }
+        else {
+          //printf("not in mapping\r\n");
+        }
+        //fflush(stdout);
+      
     }
   }
-  printf("0x%02hhx\r\n", thirdbyte);
-  fflush(stdout);
-  final_thirdbyte = thirdbyte;
+
+  //printf("0x%02hhx\r\n", thirdbyte);
+  //fflush(stdout);
+  final_buttons[0] = (final_buttons[0] & ~buttons_change_mask[0]) | (buttons[0] & buttons_change_mask[0]);
+  final_buttons[1] = (final_buttons[1] & ~buttons_change_mask[1]) | (buttons[1] & buttons_change_mask[1]);
+  final_buttons[2] = (final_buttons[2] & ~buttons_change_mask[2]) | (buttons[2] & buttons_change_mask[2]);
+
   to_joystick(horiz, vert, left_joystick);
+  prev_report = *report;
 }
 
 int16_t x_current_hid = 0;
@@ -436,6 +498,9 @@ int16_t y_current_hid = 0;
 // send mouse report 
 static void process_mouse_report(uint8_t dev_addr, hid_mouse_report_t const * report)
 {
+  uint8_t buttons[] = { 0x00, 0x00, 0x00 };
+  uint8_t buttons_change_mask[] = { 0x00, 0x00, 0x00 };
+
   //------------- button state  -------------//
   //uint8_t button_changed_mask = report->buttons ^ prev_report.buttons;
   char l = report->buttons & MOUSE_BUTTON_LEFT   ? 'L' : '-';
@@ -449,8 +514,25 @@ static void process_mouse_report(uint8_t dev_addr, hid_mouse_report_t const * re
   // printf(tempbuf);
   // fflush(stdout);
 
+  //x is inverted
   x_current_hid += (report->x)*-1;
   y_current_hid += (report->y)*1;
+
+  if (l == 'L') {
+    char ch = 'z';
+    buttonLocation loc = findSwitchMap(buttonMap, sizeof(buttonMap) / sizeof(buttonMap[0]), ch);
+    buttons[loc.byte] = buttons[loc.byte] | 1 << loc.shift;
+    buttons_change_mask[loc.byte] = buttons_change_mask[loc.byte] | 1 << loc.shift;
+  }
+  else {
+    char ch = 'z';
+    buttonLocation loc = findSwitchMap(buttonMap, sizeof(buttonMap) / sizeof(buttonMap[0]), ch);
+    buttons[loc.byte] = buttons[loc.byte] | 0 << loc.shift;
+    buttons_change_mask[loc.byte] = buttons_change_mask[loc.byte] | 1 << loc.shift;
+  }
+  final_buttons[0] = (final_buttons[0] & ~buttons_change_mask[0]) | (buttons[0] & buttons_change_mask[0]);
+  final_buttons[1] = (final_buttons[1] & ~buttons_change_mask[1]) | (buttons[1] & buttons_change_mask[1]);
+  final_buttons[2] = (final_buttons[2] & ~buttons_change_mask[2]) | (buttons[2] & buttons_change_mask[2]);
 }
 
 // Invoked when received report from device via interrupt endpoint
@@ -526,8 +608,8 @@ void button_task(void)
   imu_data3[9] = (y_delta & 0xFF);
   
   //uint8_t test_button_response[] = { 0x81, final_thirdbyte, 0x80, 0x00, 0xf8, 0xd7, 0x7a, 0x22, 0xc8, 0x7b, 0x0c };
-  uint8_t test_button_response[] = { 0x81, final_thirdbyte, 0x80, 0x00, left_joystick[0], left_joystick[1], left_joystick[2], 0x22, 0xc8, 0x7b, 0x0c };
-  uint8_t buttons_and_joysticks[] = { 0x81, final_thirdbyte, 0x80, 0x00, left_joystick[0], left_joystick[1], left_joystick[2], 0x22, 0xc8, 0x7b, 0x0c };
+  uint8_t test_button_response[] = { 0x81, final_buttons[0], final_buttons[1], final_buttons[2], left_joystick[0], left_joystick[1], left_joystick[2], 0x22, 0xc8, 0x7b, 0x0c };
+  uint8_t buttons_and_joysticks[] = { 0x81, final_buttons[0], final_buttons[1], final_buttons[2], left_joystick[0], left_joystick[1], left_joystick[2], 0x22, 0xc8, 0x7b, 0x0c };
   uint8_t final_response[sizeof(buttons_and_joysticks) + sizeof(imu_data1) + sizeof(imu_data2) + sizeof(imu_data3)];
   memcpy(final_response,buttons_and_joysticks, sizeof(buttons_and_joysticks) * sizeof(uint8_t));
   memcpy(final_response+sizeof(buttons_and_joysticks),imu_data1, sizeof(imu_data1) * sizeof(uint8_t));
