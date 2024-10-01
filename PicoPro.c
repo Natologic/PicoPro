@@ -51,16 +51,34 @@ typedef struct {
 } switchButtonMaps;
 
 typedef struct {
+  uint8_t modifier;
+  int byte;
+  int shift;
+} switchModifierMaps;
+
+typedef struct {
   int byte;
   int shift;
 } buttonLocation;
 
-buttonLocation findSwitchMap(switchButtonMaps buttonMap[], int size, char key) {
+buttonLocation findKeyMap(switchButtonMaps keyMap[], int size, char key) {
   buttonLocation loc = { -1, -1 };
   for (int i=0; i < size; i++) {
-    if (buttonMap[i].key == key) {
-      loc.byte = buttonMap[i].byte;
-      loc.shift = buttonMap[i].shift;
+    if (keyMap[i].key == key) {
+      loc.byte = keyMap[i].byte;
+      loc.shift = keyMap[i].shift;
+      break;
+    }
+  }
+  return loc;
+}
+
+buttonLocation findModifierMap(switchModifierMaps modifierMap[], int size, uint8_t modifier) {
+  buttonLocation loc = { -1, -1 };
+  for (int i=0; i < size; i++) {
+    if (modifierMap[i].modifier == modifier) {
+      loc.byte = modifierMap[i].byte;
+      loc.shift = modifierMap[i].shift;
       break;
     }
   }
@@ -69,9 +87,9 @@ buttonLocation findSwitchMap(switchButtonMaps buttonMap[], int size, char key) {
 
 // IN ORDER:
 // mapped character
-// byte of button input report (starting from 0, which is byte 3 in the final report). 3
+// byte of button input report (starting from 0, which is byte 3 in the final report).
 // bitshift count 
-switchButtonMaps buttonMap[] = { \
+switchButtonMaps keyMap[] = { \
   {'y', 0, 0}, /* Y button         */ \
   {'x', 0, 1}, /* X button         */ \
   {' ', 0, 2}, /* B button         */ \
@@ -84,6 +102,15 @@ switchButtonMaps buttonMap[] = { \
   {'s', 3, 1}, /* Left stick down  */ \
   {'a', 3, 2}, /* Left stick left  */ \
   {'d', 3, 3}, /* Left stick up    */ \
+};
+
+
+// IN ORDER:
+// mapped modifier
+// byte of button input report (starting from 0, which is byte 3 in the final report).
+// bitshift count 
+switchButtonMaps modifierMap[] = { \
+  {0x02, 2, 7}, /* ZL button         */ \
 };
 
 
@@ -359,14 +386,24 @@ void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance)
   fflush(stdout);
 }
 
-// look up new key in previous keys
+// check to see if the modifier appears in the report
+static inline bool find_modifier_in_report(hid_keyboard_report_t const *report, uint8_t modifier)
+{
+  if (report->modifier == modifier) {
+    return true;
+  }
+  return false;
+}
+
+// check to see if the keycode appears in the report
 static inline bool find_key_in_report(hid_keyboard_report_t const *report, uint8_t keycode)
 {
   for(uint8_t i=0; i<6; i++)
   {
-    if (report->keycode[i] == keycode)  return true;
+    if (report->keycode[i] == keycode) {
+      return true;
+    }
   }
-
   return false;
 }
 
@@ -398,20 +435,57 @@ static void process_kbd_report(uint8_t dev_addr, hid_keyboard_report_t const *re
   // neutral location for joystick?
   memcpy(left_joystick, joystick_neutral, sizeof(joystick_neutral));
 
+  /////////////////////////////////////////////////////////////////////////////////////////////////
+  //CHECK MODIFIER (BYTE 0)
+  /////////////////////////////////////////////////////////////////////////////////////////////////
+  // check modifier byte to see if any modifier keys are pressed
+  int8_t modifier = report->modifier;
+  if (modifier) {
+    if (find_modifier_in_report(&prev_report, modifier)) {
+      // if the modifier exists in the previous report, it is being held down
+    }
+    else {
+      // modifier exists in current but not previous report, so it is being first pressed
+      buttonLocation loc = findModifierMap(modifierMap, sizeof(modifierMap) / sizeof(modifierMap[0]), modifier);
+      printf("Pressed: Byte %d, Shift %d\r\n",loc.byte, loc.shift);
+      if (loc.byte != -1 && loc.shift != -1) {
+        buttons[loc.byte] = buttons[loc.byte] | 1 << loc.shift;
+        buttons_change_mask[loc.byte] = buttons_change_mask[loc.byte] | 1 << loc.shift;
+      }
+    }
+
+  }
+  // Check for modifier released
+  uint8_t prev_modifier = prev_report.modifier;
+  if ( prev_modifier && !find_modifier_in_report(report, prev_modifier) )
+  {
+    // modifier existed in previous report but not in current report, so this means the modifier is released
+    buttonLocation loc = findModifierMap(modifierMap, sizeof(modifierMap) / sizeof(modifierMap[0]), prev_modifier);
+    printf("Released: Byte %d, Shift %d\r\n",loc.byte, loc.shift);
+    if (loc.byte != -1 && loc.shift != -1) {
+      buttons[loc.byte] = buttons[loc.byte] | 0 << loc.shift;
+      buttons_change_mask[loc.byte] = buttons_change_mask[loc.byte] | 1 << loc.shift;
+    }
+  }
+
+  /////////////////////////////////////////////////////////////////////////////////////////////////
+  //CHECK KEYS (BYTES 2-7)
+  /////////////////////////////////////////////////////////////////////////////////////////////////
   // check all 6 elements of the report to see if any of the corresponding keys are pressed
   for(uint8_t i=0; i<6; i++)
   {
     uint8_t keycode = report->keycode[i];
     if (keycode) {
       if (find_key_in_report(&prev_report, keycode)) {
-        // exist in previous report means the current key is holding
+        // if the key exists in the previous report, it is being held down
       }
       else {
-        //bool const is_shift = report->modifier & (KEYBOARD_MODIFIER_LEFTSHIFT | KEYBOARD_MODIFIER_RIGHTSHIFT);
+        // key exists in current but not previous report, so it is being first pressed
+        bool const is_shift = report->modifier & (KEYBOARD_MODIFIER_LEFTSHIFT | KEYBOARD_MODIFIER_RIGHTSHIFT);
         //char ch = is_shift ? keycode2ascii[keycode][1] : keycode2ascii[keycode][0];
         char ch = keycode2ascii[keycode][0];
         //printf("%c: ",ch);
-        buttonLocation loc = findSwitchMap(buttonMap, sizeof(buttonMap) / sizeof(buttonMap[0]), ch);
+        buttonLocation loc = findKeyMap(keyMap, sizeof(keyMap) / sizeof(keyMap[0]), ch);
         if (loc.byte != -1 && loc.shift != -1) {
           if (loc.byte == 3) {
             if (loc.shift == 0) {
@@ -447,9 +521,9 @@ static void process_kbd_report(uint8_t dev_addr, hid_keyboard_report_t const *re
     uint8_t prev_keycode = prev_report.keycode[i];
     if ( prev_keycode && !find_key_in_report(report, prev_keycode) )
     {
-      // key existed in previous report but not in current report means the key is released
+      // key existed in previous report but not in current report, so this means the key is released
       char ch = keycode2ascii[prev_keycode][0];
-      buttonLocation loc = findSwitchMap(buttonMap, sizeof(buttonMap) / sizeof(buttonMap[0]), ch);
+      buttonLocation loc = findKeyMap(keyMap, sizeof(keyMap) / sizeof(keyMap[0]), ch);
         if (loc.byte != -1 && loc.shift != -1) {
           if (loc.byte == 3) {
             if (loc.shift == 0) {
@@ -520,13 +594,13 @@ static void process_mouse_report(uint8_t dev_addr, hid_mouse_report_t const * re
 
   if (l == 'L') {
     char ch = 'z';
-    buttonLocation loc = findSwitchMap(buttonMap, sizeof(buttonMap) / sizeof(buttonMap[0]), ch);
+    buttonLocation loc = findKeyMap(keyMap, sizeof(keyMap) / sizeof(keyMap[0]), ch);
     buttons[loc.byte] = buttons[loc.byte] | 1 << loc.shift;
     buttons_change_mask[loc.byte] = buttons_change_mask[loc.byte] | 1 << loc.shift;
   }
   else {
     char ch = 'z';
-    buttonLocation loc = findSwitchMap(buttonMap, sizeof(buttonMap) / sizeof(buttonMap[0]), ch);
+    buttonLocation loc = findKeyMap(keyMap, sizeof(keyMap) / sizeof(keyMap[0]), ch);
     buttons[loc.byte] = buttons[loc.byte] | 0 << loc.shift;
     buttons_change_mask[loc.byte] = buttons_change_mask[loc.byte] | 1 << loc.shift;
   }
